@@ -595,9 +595,49 @@ impl<T> sealed_trait::VaArgSafe for *const T {}
 impl<'f> VaListImpl<'f> {
     /// Advance to the next arg.
     #[inline]
-    pub unsafe fn arg<T: sealed_trait::VaArgSafe>(&mut self) -> T {
+    pub unsafe fn arg<T: sealed_trait::VaArgSafe + Sized>(&mut self) -> T {
         // SAFETY: the caller must uphold the safety contract for `va_arg`.
+
+        #[cfg(not(target_arch = "xtensa"))]
         unsafe { va_arg(self) }
+        #[cfg(target_arch = "xtensa")]
+        {
+            // va_arg intrinsic is buggy on xtensa or incompatible with gcc.
+            // The following solution was reverse engineered from assembly.
+            // It only works for agruments with T size <= 4 bytes that are promoted to 4 bytes.
+            // In practice 4 bytes is enough for all esp32 logging from wifi driver.
+            let size_of_t = crate::mem::size_of::<T>();
+            assert!(size_of_t <= 4, "xtensa VaListImpl only works for T with size max 4 bytes");
+
+            // Get the byte offset we're supposed to get data at.
+            // The initial value of ndx depends on how many fixed args the function
+            // has before the variable arguments begin. Each time we read an argument
+            // ndx gets updated. The rest of the struct stays the same.
+            let mut byte_offset = self.ndx as isize;
+            // Now the question is where to get the data from: reg or stk.
+            let ptr = if byte_offset <= 20 {
+                // Low arg numbers come from reg.
+                (self.reg as *mut u8).offset(byte_offset)
+            } else {
+                // High arg numbers come from stk.
+                // First time asking for an offset bigger than 20 but less than 32,
+                // jump to 32. Stk seems to only be valid from byte index 32.
+                if byte_offset < 32 {
+                    byte_offset = 32;
+                }
+                (self.stk as *mut u8).offset(byte_offset)
+            };
+            // The next ndx is byte_offset and 4 bytes forward.
+            self.ndx = (byte_offset + 4) as i32;
+            // We now have ptr that points to the data we want but promoted to 4 bytes. Skip any unwanted bytes.
+            let ptr = (ptr as *mut u8).offset((4-size_of_t) as isize);
+
+            // Make a return value of requested size and copy bytes. How else can I make a T? I had to add + Sized.
+            let mut ret: T = crate::mem::zeroed();
+            let ret_ptr = &mut ret as *mut _ as *mut u8; // We need to write it treating it as bytes.
+            ret_ptr.copy_from(ptr, size_of_t);
+            ret
+        }
     }
 
     /// Copies the `va_list` at the current location.
